@@ -1,0 +1,127 @@
+kokoro-tts:
+    candy:
+        description: |-
+            Multi-voice offline text-to-speech: the Kokoro-82M ONNX model plus its multi-voice pack,
+            baked in at build time and driven by the sherpa-onnx engine that layer-sherpa-onnx installs.
+            No runtime fetch, no API key, no cloud. This candy exists because the sherpa-onnx candy
+            bakes exactly ONE VITS voice — enough for a single-speaker read, not enough for a
+            TWO-HOST podcast. Kokoro ships a multi-voice pack selected per utterance by speaker id.
+        require:
+            - '@github.com/opencharly/layer-sherpa-onnx:v2026.272.0445'
+            - '@github.com/opencharly/layer-ffmpeg:v2026.272.0056'
+        env:
+            KOKORO_MODEL_DIR: "~/.local/share/kokoro-tts/models"
+        var:
+            # Pinned artifact. sha256/size verified against the release asset on 2026-10-08.
+            KOKORO_MODEL: kokoro-en-v0_19
+        plan:
+            - run: create the model directory
+              mkdir: "${HOME}/.local/share/kokoro-tts/models"
+              run_as: "${USER}"
+            - run: download the pinned Kokoro model + voice pack (319,625,534 bytes upstream)
+              run_as: "${USER}"
+              command: |
+                curl -fsSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${KOKORO_MODEL}.tar.bz2" \
+                  | tar -xjf - -C "${HOME}/.local/share/kokoro-tts/models"
+            - check: the Kokoro ONNX model is present
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/model.onnx
+                exists: true
+            - check: the multi-voice pack is present (this is the whole point of the candy)
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/voices.bin
+                exists: true
+            - check: the tokens file ships next to the model
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/tokens.txt
+                exists: true
+            - check: the espeak-ng data dir ships in the artifact (Kokoro's G2P needs it)
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/espeak-ng-data
+                exists: true
+            - check: the offline-tts engine from the sherpa-onnx dependency is present
+              id: kokoro-engine-present
+              file:
+                file: ${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts
+                exists: true
+            - check: SYNTHESIS — the pinned model actually renders audio (the acceptance that can fail)
+              id: kokoro-synthesises
+              exit_status: 0
+              command: |
+                set -eu
+                M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                E="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                out="$(mktemp -d)/probe.wav"
+                "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
+                     --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
+                     --sid=0 --output-filename="$out" "the desk checks its own receipts"
+                test -s "$out"
+                ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" | awk '{exit ($1 > 0.3) ? 0 : 1}'
+            - check: two speaker ids render DIFFERENT audio — the two-host requirement, asserted
+              id: kokoro-two-voices-differ
+              exit_status: 0
+              command: |
+                set -eu
+                M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                E="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                d="$(mktemp -d)"
+                for sid in 0 3; do
+                  "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
+                       --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
+                       --sid=$sid --output-filename="$d/$sid.wav" "one voice must not be the other"
+                done
+                test -s "$d/0.wav" && test -s "$d/3.wav"
+                ! cmp -s "$d/0.wav" "$d/3.wav"
+
+kokoro-tts-skill:
+    skill:
+        name: kokoro-tts
+        family: tools
+        owner: kokoro-tts
+        description: |-
+            Kokoro-82M multi-voice offline text-to-speech, driven by the sherpa-onnx engine. Use when a
+            task needs more than one voice from a local TTS (a two-host podcast, a dialogue, an
+            audiobook with characters) or when it needs speech without a cloud API key.
+        content: |
+            # kokoro-tts — multi-voice offline TTS
+
+            ## What it is
+
+            The Kokoro-82M ONNX model plus its multi-voice pack, pinned and baked in. The engine is
+            `layer-sherpa-onnx`'s `sherpa-onnx-offline-tts`; this candy supplies the MODEL, the VOICES
+            and the verified invocation. Nothing is fetched at run time.
+
+            ## Why it exists
+
+            `layer-sherpa-onnx` bakes exactly one VITS voice (`en_US-lessac-high`). That is fine for a
+            read-aloud and useless for a two-host show. Kokoro selects a voice per utterance with
+            `--sid`, so one model yields many speakers.
+
+            ## Verified invocation (sherpa-onnx v1.12.23)
+
+            ```
+            sherpa-onnx-offline-tts \\
+              --kokoro-model=$M/model.onnx \\
+              --kokoro-voices=$M/voices.bin \\
+              --kokoro-tokens=$M/tokens.txt \\
+              --kokoro-data-dir=$M/espeak-ng-data \\
+              --sid=0 --output-filename=out.wav "text to speak"
+            ```
+
+            `$M` = `${KOKORO_MODEL_DIR}/kokoro-en-v0_19`.
+
+            Two traps, both measured: every option uses `=` form (`--sid=0`, `--output-filename=x.wav`);
+            and the output flag is **`--output-filename`** — there is no `--output-wav` in this version,
+            despite what some shipped documentation still says.
+
+            ## Env
+
+            | Variable | Value |
+            |---|---|
+            | `KOKORO_MODEL_DIR` | `~/.local/share/kokoro-tts/models` |
+
+            ## Related
+
+            - `/charly-tools:podcast-audio` — turns a two-host SCRIPT into an episode using this engine
+            - `/charly-tools:sherpa-onnx` — the engine, and the single-voice alternative
+            - `/charly-tools:sag` — the cloud (ElevenLabs) alternative
