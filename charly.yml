@@ -1,0 +1,249 @@
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - rpm
+    merge:
+        auto: false
+        max_mb: 128
+
+kokoro-tts:
+    candy:
+        description: |-
+            Multi-voice offline text-to-speech: the Kokoro-82M ONNX model plus its multi-voice pack,
+            baked in at build time and driven by the sherpa-onnx engine that layer-sherpa-onnx installs.
+            No runtime fetch, no API key, no cloud. This candy exists because the sherpa-onnx candy
+            bakes exactly ONE VITS voice — enough for a single-speaker read, not enough for a
+            TWO-HOST podcast. Kokoro ships a multi-voice pack selected per utterance by speaker id.
+        require:
+            - '@github.com/opencharly/layer-sherpa-onnx:v2026.272.0445'
+            - '@github.com/opencharly/layer-ffmpeg:v2026.272.0056'
+        env:
+            KOKORO_MODEL_DIR: "~/.local/share/kokoro-tts/models"
+        var:
+            # The release tag is the FETCH COORDINATE; the sha256 below is the IDENTITY, and the
+            # `kokoro-verify-artifact` step below enforces it — so a retagged or tampered asset
+            # fails the build instead of silently shipping a different model.
+            KOKORO_MODEL: kokoro-en-v0_19
+            # 319,625,534 bytes upstream (measured 2026-10-08).
+            # NOTE `run:` steps interpolate ${KOKORO_MODEL} (they run under the ENV the candy
+            # emits), but a `check:` step's fields resolve ONLY the auto-exports (${HOME},
+            # ${USER}, ${ARCH}) — a candy var: is refused, and the step is SKIPPED as
+            # "unresolved variables: KOKORO_MODEL" rather than failing. Measured on
+            # 2026-10-08: six checks silently stopped asserting. The literal name below is
+            # therefore deliberate in the check steps; keep it in step with KOKORO_MODEL.
+            KOKORO_MODEL_SHA256: 912804855a04745fa77a30be545b3f9a5d15c4d66db00b88cbcd4921df605ac7
+        plan:
+            - run: create the model directory
+              mkdir: "${HOME}/.local/share/kokoro-tts/models"
+              run_as: "${USER}"
+            - run: download the pinned Kokoro model + voice pack (319,625,534 bytes upstream)
+              download: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${KOKORO_MODEL}.tar.bz2"
+              to: "${HOME}/.local/share/kokoro-tts/models/${KOKORO_MODEL}.tar.bz2"
+              run_as: "${USER}"
+            - run: verify the pinned artifact by sha256 and extract it
+              id: kokoro-verify-artifact
+              run_as: "${USER}"
+              command: |
+                set -eu
+                cd "${HOME}/.local/share/kokoro-tts/models"
+                echo "${KOKORO_MODEL_SHA256}  ${KOKORO_MODEL}.tar.bz2" | sha256sum -c -
+                tar -xjf "${KOKORO_MODEL}.tar.bz2"
+                rm -f "${KOKORO_MODEL}.tar.bz2"
+            - check: the Kokoro ONNX model is present
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/model.onnx
+                exists: true
+            - check: the multi-voice pack is present (this is the whole point of the candy)
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/voices.bin
+                exists: true
+            - check: the tokens file ships next to the model
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/tokens.txt
+                exists: true
+            - check: the espeak-ng data dir ships in the artifact (Kokoro's G2P needs it)
+              file:
+                file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/espeak-ng-data
+                exists: true
+            - check: the offline-tts engine from the sherpa-onnx dependency is present
+              id: kokoro-engine-present
+              file:
+                file: ${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts
+                exists: true
+            - check: SYNTHESIS — the pinned model actually renders audio (the acceptance that can fail)
+              id: kokoro-synthesises
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                E="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                out="$(mktemp -d)/probe.wav"
+                "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
+                     --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
+                     --sid=1 --output-filename="$out" "the desk checks its own receipts"
+                test -s "$out"
+                ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" | awk '{exit ($1 > 0.3) ? 0 : 1}'
+            - check: two speaker ids render DIFFERENT audio — the two-host requirement, asserted
+              id: kokoro-two-voices-differ
+              exit_status: 0
+              context:
+                - build
+                - runtime
+              command: |
+                set -eu
+                M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
+                E="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
+                d="$(mktemp -d)"
+                for sid in 1 6; do
+                  "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
+                       --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
+                       --sid=$sid --output-filename="$d/$sid.wav" "one voice must not be the other"
+                done
+                test -s "$d/1.wav" && test -s "$d/6.wav"
+                ! cmp -s "$d/1.wav" "$d/6.wav"
+
+# =============================================================================
+# The R10 VENUE — /charly-check:check, "R10 gate by change class".
+#
+# The candy's own `check:` steps ARE the acceptance that can fail, and they run in
+# BOTH contexts: `charly check box kokoro-tts-app` proves synthesis on the built image
+# without deploying anything, and `charly check live` re-proves the SAME synthesis
+# against the running pod. That is what makes the bed's fresh-rebuild leg assert the
+# CANDY rather than merely that a container is up. The bed adds no duplicate checks
+# (R3): it contributes the disposable venue.
+#
+# `base:` is an EXTERNAL OCI ref on purpose. Reaching a distro box through a namespace
+# import only resolves inside the umbrella's project graph, and this repo has to be
+# self-testable from its own checkout. The distro tag chain is load-bearing, not
+# decoration: the package resolver walks the IMAGE's declared chain
+# most-specific-first, so a box declaring `base:` alone matches no per-distro section
+# and silently installs nothing.
+# =============================================================================
+kokoro-tts-app:
+    candy:
+        base: quay.io/fedora/fedora:43
+        description: |-
+            The kokoro-tts box: a minimal Fedora base composing THIS checkout's `kokoro-tts`
+            candy (no @github pin, so a bed run always tests the local tree). It exists so the
+            candy has a disposable R10 venue — `charly check run check-kokoro-tts-pod` builds it,
+            deploys it, checks it live, and rebuilds it fresh.
+        distro:
+            - fedora:43
+            - fedora
+        candy:
+            - kokoro-tts
+        plan:
+            - check: the kokoro-tts-app box was built on the Fedora 43 base it declares
+              id: kokoro-tts-app-base-identity
+              exit_status: 0
+              stdout:
+                - contains: ID=fedora
+                - contains: VERSION_ID=43
+              context:
+                - build
+                - runtime
+              command: cat /etc/os-release
+check-kokoro-tts-pod:
+    pod:
+        image: kokoro-tts-app
+        disposable: true
+        lifecycle: dev
+        description: >-
+            R10 bed for the kokoro-tts candy: the disposable pod the candy is proved on. It
+            builds kokoro-tts-app (which sha256-verifies and installs the pinned Kokoro-82M
+            artifact), deploys it, runs the candy's synthesis checks live inside it, rebuilds
+            it fresh, and tears it down. `charly check run check-kokoro-tts-pod` is the whole
+            gate; it is disposable, so the runner may destroy and rebuild it unattended.
+        plan:
+            - check: the kokoro-tts pod reached steady state
+              id: kokoro-pod-running
+              exit_status: 0
+              stdout:
+                - contains: '"kind": "pod"'
+                - contains: check-kokoro-tts-pod
+              context:
+                - runtime
+              command:
+                command: ${CHARLY_BIN} status --json
+                in_container: false
+kokoro-tts-skill:
+    skill:
+        name: kokoro-tts
+        family: tools
+        owner: kokoro-tts
+        description: |-
+            Kokoro-82M multi-voice offline text-to-speech, driven by the sherpa-onnx engine. Use when a
+            task needs more than one voice from a local TTS (a two-host podcast, a dialogue, an
+            audiobook with characters) or when it needs speech without a cloud API key.
+        content: |
+            # kokoro-tts — multi-voice offline TTS
+
+            ## What it is
+
+            The Kokoro-82M ONNX model plus its multi-voice pack, pinned and baked in. The engine is
+            `layer-sherpa-onnx`'s `sherpa-onnx-offline-tts`; this candy supplies the MODEL, the VOICES
+            and the verified invocation. Nothing is fetched at run time.
+
+            ## Why it exists
+
+            `layer-sherpa-onnx` bakes exactly one VITS voice (`en_US-lessac-high`). That is fine for a
+            read-aloud and useless for a two-host show. Kokoro selects a voice per utterance with
+            `--sid`, so one model yields many speakers.
+
+            ## Verified invocation (sherpa-onnx v1.12.23)
+
+            ```
+            sherpa-onnx-offline-tts \\
+              --kokoro-model=$M/model.onnx \\
+              --kokoro-voices=$M/voices.bin \\
+              --kokoro-tokens=$M/tokens.txt \\
+              --kokoro-data-dir=$M/espeak-ng-data \\
+              --sid=0 --output-filename=out.wav "text to speak"
+            ```
+
+            `$M` = `${KOKORO_MODEL_DIR}/${KOKORO_MODEL}`.
+
+            Two traps, both measured: every option uses `=` form (`--sid=0`, `--output-filename=x.wav`);
+            and the output flag is **`--output-filename`** — there is no `--output-wav` in this version,
+            despite what some shipped documentation still says.
+
+            ## The voices — from the model's OWN metadata, not from a guess
+
+            The artifact carries `speaker2id`, so the mapping is a fact of the model
+            (`n_speakers = 11`):
+
+            | sid | voice | voice |
+            |---|---|---|
+            | 0 | `af` | US female |
+            | 1 | `af_bella` | US female |
+            | 2 | `af_nicole` | US female |
+            | 3 | `af_sarah` | US female |
+            | 4 | `af_sky` | US female |
+            | 5 | `am_adam` | US male |
+            | 6 | `am_michael` | US male |
+            | 7 | `bf_emma` | UK female |
+            | 8 | `bf_isabella` | UK female |
+            | 9 | `bm_george` | UK male |
+            | 10 | `bm_lewis` | UK male |
+
+            `a`/`b` = American/British, `f`/`m` = female/male. Two ids that read as
+            "different numbers" can be the SAME gender — `0` and `3` are both female —
+            so pick a pair from this table, never from the numeric ordering.
+
+            ## Env
+
+            | Variable | Value |
+            |---|---|
+            | `KOKORO_MODEL_DIR` | `~/.local/share/kokoro-tts/models` |
+
+            ## Related
+
+            - `/charly-tools:podcast-audio` — turns a two-host SCRIPT into an episode using this engine
+            - `/charly-tools:sherpa-onnx` — the engine, and the single-voice alternative
+            - `/charly-tools:sag` — the cloud (ElevenLabs) alternative
