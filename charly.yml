@@ -1,3 +1,14 @@
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - rpm
+    merge:
+        auto: false
+        max_mb: 128
+
 kokoro-tts:
     candy:
         description: |-
@@ -12,17 +23,35 @@ kokoro-tts:
         env:
             KOKORO_MODEL_DIR: "~/.local/share/kokoro-tts/models"
         var:
-            # Pinned artifact. sha256/size verified against the release asset on 2026-10-08.
+            # The release tag is the FETCH COORDINATE; the sha256 below is the IDENTITY, and the
+            # `kokoro-verify-artifact` step below enforces it — so a retagged or tampered asset
+            # fails the build instead of silently shipping a different model.
             KOKORO_MODEL: kokoro-en-v0_19
+            # 319,625,534 bytes upstream (measured 2026-10-08).
+            # NOTE `run:` steps interpolate ${KOKORO_MODEL} (they run under the ENV the candy
+            # emits), but a `check:` step's fields resolve ONLY the auto-exports (${HOME},
+            # ${USER}, ${ARCH}) — a candy var: is refused, and the step is SKIPPED as
+            # "unresolved variables: KOKORO_MODEL" rather than failing. Measured on
+            # 2026-10-08: six checks silently stopped asserting. The literal name below is
+            # therefore deliberate in the check steps; keep it in step with KOKORO_MODEL.
+            KOKORO_MODEL_SHA256: 912804855a04745fa77a30be545b3f9a5d15c4d66db00b88cbcd4921df605ac7
         plan:
             - run: create the model directory
               mkdir: "${HOME}/.local/share/kokoro-tts/models"
               run_as: "${USER}"
             - run: download the pinned Kokoro model + voice pack (319,625,534 bytes upstream)
+              download: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${KOKORO_MODEL}.tar.bz2"
+              to: "${HOME}/.local/share/kokoro-tts/models/${KOKORO_MODEL}.tar.bz2"
+              run_as: "${USER}"
+            - run: verify the pinned artifact by sha256 and extract it
+              id: kokoro-verify-artifact
               run_as: "${USER}"
               command: |
-                curl -fsSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${KOKORO_MODEL}.tar.bz2" \
-                  | tar -xjf - -C "${HOME}/.local/share/kokoro-tts/models"
+                set -eu
+                cd "${HOME}/.local/share/kokoro-tts/models"
+                echo "${KOKORO_MODEL_SHA256}  ${KOKORO_MODEL}.tar.bz2" | sha256sum -c -
+                tar -xjf "${KOKORO_MODEL}.tar.bz2"
+                rm -f "${KOKORO_MODEL}.tar.bz2"
             - check: the Kokoro ONNX model is present
               file:
                 file: ${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19/model.onnx
@@ -47,6 +76,9 @@ kokoro-tts:
             - check: SYNTHESIS — the pinned model actually renders audio (the acceptance that can fail)
               id: kokoro-synthesises
               exit_status: 0
+              context:
+                - build
+                - runtime
               command: |
                 set -eu
                 M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
@@ -60,6 +92,9 @@ kokoro-tts:
             - check: two speaker ids render DIFFERENT audio — the two-host requirement, asserted
               id: kokoro-two-voices-differ
               exit_status: 0
+              context:
+                - build
+                - runtime
               command: |
                 set -eu
                 M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
@@ -73,6 +108,70 @@ kokoro-tts:
                 test -s "$d/1.wav" && test -s "$d/6.wav"
                 ! cmp -s "$d/1.wav" "$d/6.wav"
 
+# =============================================================================
+# The R10 VENUE — /charly-check:check, "R10 gate by change class".
+#
+# The candy's own `check:` steps ARE the acceptance that can fail, and they run in
+# BOTH contexts: `charly check box kokoro-tts-app` proves synthesis on the built image
+# without deploying anything, and `charly check live` re-proves the SAME synthesis
+# against the running pod. That is what makes the bed's fresh-rebuild leg assert the
+# CANDY rather than merely that a container is up. The bed adds no duplicate checks
+# (R3): it contributes the disposable venue.
+#
+# `base:` is an EXTERNAL OCI ref on purpose. Reaching a distro box through a namespace
+# import only resolves inside the umbrella's project graph, and this repo has to be
+# self-testable from its own checkout. The distro tag chain is load-bearing, not
+# decoration: the package resolver walks the IMAGE's declared chain
+# most-specific-first, so a box declaring `base:` alone matches no per-distro section
+# and silently installs nothing.
+# =============================================================================
+kokoro-tts-app:
+    candy:
+        base: quay.io/fedora/fedora:43
+        description: |-
+            The kokoro-tts box: a minimal Fedora base composing THIS checkout's `kokoro-tts`
+            candy (no @github pin, so a bed run always tests the local tree). It exists so the
+            candy has a disposable R10 venue — `charly check run check-kokoro-tts-pod` builds it,
+            deploys it, checks it live, and rebuilds it fresh.
+        distro:
+            - fedora:43
+            - fedora
+        candy:
+            - kokoro-tts
+        plan:
+            - check: the kokoro-tts-app box was built on the Fedora 43 base it declares
+              id: kokoro-tts-app-base-identity
+              exit_status: 0
+              stdout:
+                - contains: ID=fedora
+                - contains: VERSION_ID=43
+              context:
+                - build
+                - runtime
+              command: cat /etc/os-release
+check-kokoro-tts-pod:
+    pod:
+        image: kokoro-tts-app
+        disposable: true
+        lifecycle: dev
+        description: >-
+            R10 bed for the kokoro-tts candy: the disposable pod the candy is proved on. It
+            builds kokoro-tts-app (which sha256-verifies and installs the pinned Kokoro-82M
+            artifact), deploys it, runs the candy's synthesis checks live inside it, rebuilds
+            it fresh, and tears it down. `charly check run check-kokoro-tts-pod` is the whole
+            gate; it is disposable, so the runner may destroy and rebuild it unattended.
+        plan:
+            - check: the kokoro-tts pod reached steady state
+              id: kokoro-pod-running
+              exit_status: 0
+              stdout:
+                - contains: '"kind": "pod"'
+                - contains: check-kokoro-tts-pod
+              context:
+                - runtime
+              command:
+                command: ${CHARLY_BIN} status --json
+                in_container: false
 kokoro-tts-skill:
     skill:
         name: kokoro-tts
@@ -108,7 +207,7 @@ kokoro-tts-skill:
               --sid=0 --output-filename=out.wav "text to speak"
             ```
 
-            `$M` = `${KOKORO_MODEL_DIR}/kokoro-en-v0_19`.
+            `$M` = `${KOKORO_MODEL_DIR}/${KOKORO_MODEL}`.
 
             Two traps, both measured: every option uses `=` form (`--sid=0`, `--output-filename=x.wav`);
             and the output flag is **`--output-filename`** — there is no `--output-wav` in this version,
