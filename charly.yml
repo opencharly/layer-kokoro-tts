@@ -54,7 +54,7 @@ kokoro-tts:
                 out="$(mktemp -d)/probe.wav"
                 "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
                      --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
-                     --sid=0 --output-filename="$out" "the desk checks its own receipts"
+                     --sid=1 --output-filename="$out" "the desk checks its own receipts"
                 test -s "$out"
                 ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" | awk '{exit ($1 > 0.3) ? 0 : 1}'
             - check: two speaker ids render DIFFERENT audio — the two-host requirement, asserted
@@ -65,13 +65,13 @@ kokoro-tts:
                 M="${HOME}/.local/share/kokoro-tts/models/kokoro-en-v0_19"
                 E="${HOME}/.local/share/sherpa-onnx/runtime/bin/sherpa-onnx-offline-tts"
                 d="$(mktemp -d)"
-                for sid in 0 3; do
+                for sid in 1 6; do
                   "$E" --kokoro-model="$M/model.onnx" --kokoro-voices="$M/voices.bin" \
                        --kokoro-tokens="$M/tokens.txt" --kokoro-data-dir="$M/espeak-ng-data" \
                        --sid=$sid --output-filename="$d/$sid.wav" "one voice must not be the other"
                 done
-                test -s "$d/0.wav" && test -s "$d/3.wav"
-                ! cmp -s "$d/0.wav" "$d/3.wav"
+                test -s "$d/1.wav" && test -s "$d/6.wav"
+                ! cmp -s "$d/1.wav" "$d/6.wav"
 
 kokoro-tts-skill:
     skill:
@@ -113,6 +113,29 @@ kokoro-tts-skill:
             Two traps, both measured: every option uses `=` form (`--sid=0`, `--output-filename=x.wav`);
             and the output flag is **`--output-filename`** — there is no `--output-wav` in this version,
             despite what some shipped documentation still says.
+
+            ## The voices — from the model's OWN metadata, not from a guess
+
+            The artifact carries `speaker2id`, so the mapping is a fact of the model
+            (`n_speakers = 11`):
+
+            | sid | voice | voice |
+            |---|---|---|
+            | 0 | `af` | US female |
+            | 1 | `af_bella` | US female |
+            | 2 | `af_nicole` | US female |
+            | 3 | `af_sarah` | US female |
+            | 4 | `af_sky` | US female |
+            | 5 | `am_adam` | US male |
+            | 6 | `am_michael` | US male |
+            | 7 | `bf_emma` | UK female |
+            | 8 | `bf_isabella` | UK female |
+            | 9 | `bm_george` | UK male |
+            | 10 | `bm_lewis` | UK male |
+
+            `a`/`b` = American/British, `f`/`m` = female/male. Two ids that read as
+            "different numbers" can be the SAME gender — `0` and `3` are both female —
+            so pick a pair from this table, never from the numeric ordering.
 
             ## Env
 
